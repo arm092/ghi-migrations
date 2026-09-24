@@ -1,0 +1,207 @@
+namespace arm092.migrations
+
+import os "go:os"
+import filepath "go:path/filepath"
+import regexp "go:regexp"
+import strings "go:strings"
+
+func schemaIdentifier(name string) string {
+	if !regexp.MatchString(`^[A-Za-z_][A-Za-z0-9_]*$`, name) {
+		throw new MigrationError("Invalid schema identifier: " + name)
+	}
+
+	return "\"" + name + "\""
+}
+
+func schemaStatement(statement string) string {
+	statement = strings.TrimSpace(statement)
+	if statement == "" {
+		throw new MigrationError("Schema statement cannot be empty")
+	}
+	if !strings.HasSuffix(statement, ";") {
+		statement += ";"
+	}
+
+	return statement
+}
+
+func writeNewMigrationFile(path string, statement string) {
+	var file * os.File
+	try {
+		file = os.OpenFile(path, os.O_WRONLY | os.O_CREATE | os.O_EXCL, 0600)
+	} catch err GoError {
+		throw new MigrationError("Cannot create migration file " + path + ": " + err.message)
+	}
+	try {
+		file.Write([]byte(statement))
+		file.Close()
+	} catch err GoError {
+		file.Close()
+		os.Remove(path)
+		throw new MigrationError("Cannot write migration file " + path + ": " + err.message)
+	}
+}
+
+class Column {
+	private name string
+	private kind string
+	private nullable bool
+	private primary bool
+
+	constructor(name string, kind string, nullable bool, primary bool) {
+		schemaIdentifier(name)
+		if kind != "INTEGER" && kind != "TEXT" && kind != "REAL" && kind != "BLOB" && kind != "NUMERIC" {
+			throw new MigrationError("Unsupported SQLite column type: " + kind)
+		}
+		if primary &&(kind != "INTEGER" || nullable) {
+			throw new MigrationError("SQLite primary key must be a non-null INTEGER column")
+		}
+		this.name = name
+		this.kind = kind
+		this.nullable = nullable
+		this.primary = primary
+	}
+
+	public func Name() string {
+		return this.name
+	}
+	public func IsPrimary() bool {
+		return this.primary
+	}
+	public func SQL() string {
+		statement := schemaIdentifier(this.name) + " " + this.kind
+		if this.primary {
+			return statement + " PRIMARY KEY"
+		}
+		if !this.nullable {
+			statement += " NOT NULL"
+		}
+
+		return statement
+	}
+}
+
+class SchemaChange {
+	private up string
+	private down string
+
+	constructor(up string, down string) {
+		this.up = schemaStatement(up)
+		this.down = schemaStatement(down)
+	}
+
+	public func UpSQL() string {
+		return this.up
+	}
+	public func DownSQL() string {
+		return this.down
+	}
+}
+
+class SchemaBuilder {
+	constructor(dialect string) {
+		if dialect != "sqlite" {
+			throw new MigrationError("Unsupported schema dialect: " + dialect)
+		}
+	}
+
+	public func Integer(name string, nullable bool, primaryKey bool) Column {
+		return new Column(name, "INTEGER", nullable, primaryKey)
+	}
+
+	public func Text(name string, nullable bool) Column {
+		return new Column(name, "TEXT", nullable, false)
+	}
+	public func Real(name string, nullable bool) Column {
+		return new Column(name, "REAL", nullable, false)
+	}
+	public func Blob(name string, nullable bool) Column {
+		return new Column(name, "BLOB", nullable, false)
+	}
+	public func Numeric(name string, nullable bool) Column {
+		return new Column(name, "NUMERIC", nullable, false)
+	}
+
+	public func CreateTable(name string, columns []Column) SchemaChange {
+		table := schemaIdentifier(name)
+		if len(columns) == 0 {
+			throw new MigrationError("Table must contain at least one column")
+		}
+		definitions := []string{}
+		seen := map[string]bool{}
+		primary := false
+		for _, column := range columns {
+			key := strings.ToLower(column.Name())
+			if seen[key] {
+				throw new MigrationError("Duplicate table column: " + column.Name())
+			}
+			seen[key] = true
+			if column.IsPrimary() {
+				if primary {
+					throw new MigrationError("Table has multiple primary keys: " + name)
+				}
+				primary = true
+			}
+			definitions = append(definitions, column.SQL())
+		}
+
+		return new SchemaChange("CREATE TABLE " + table + " (" + strings.Join(definitions, ", ") + ")", "DROP TABLE " + table)
+	}
+
+	public func CreateIndex(name string, table string, columns []string, unique bool) SchemaChange {
+		index := schemaIdentifier(name)
+		tableName := schemaIdentifier(table)
+		if len(columns) == 0 {
+			throw new MigrationError("Index must contain at least one column")
+		}
+		quoted := []string{}
+		seen := map[string]bool{}
+		for _, column := range columns {
+			key := strings.ToLower(column)
+			if seen[key] {
+				throw new MigrationError("Duplicate index column: " + column)
+			}
+			seen[key] = true
+			quoted = append(quoted, schemaIdentifier(column))
+		}
+		prefix := "CREATE INDEX "
+		if unique {
+			prefix = "CREATE UNIQUE INDEX "
+		}
+
+		return new SchemaChange(prefix + index + " ON " + tableName + " (" + strings.Join(quoted, ", ") + ")", "DROP INDEX " + index)
+	}
+
+	public func Raw(up string, down string) SchemaChange {
+		return new SchemaChange(up, down)
+	}
+
+	public func Write(directory string, filename string, changes []SchemaChange) {
+		if strings.TrimSpace(directory) == "" {
+			throw new MigrationError("Migration directory is required")
+		}
+		if !regexp.MatchString(`^[0-9]+_[a-z0-9_]+\.sql$`, filename) {
+			throw new MigrationError("Invalid SQL migration filename: " + filename)
+		}
+		if len(changes) == 0 {
+			throw new MigrationError("Migration must contain at least one change")
+		}
+		ups := []string{}
+		downs := []string{}
+		for _, change := range changes {
+			ups = append(ups, change.UpSQL())
+		}
+		for i := len(changes) - 1; i >= 0; i-- {
+			downs = append(downs, changes[i].DownSQL())
+		}
+		upPath := filepath.Join(directory, filename)
+		downPath := filepath.Join(directory, strings.TrimSuffix(filename, ".sql") + ".down.sql")
+		writeNewMigrationFile(upPath, strings.Join(ups, "\n") + "\n")
+		try {
+			writeNewMigrationFile(downPath, strings.Join(downs, "\n") + "\n")
+		} catch err MigrationError {
+			os.Remove(upPath)
+			throw err
+		}
+	}
+}

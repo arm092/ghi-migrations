@@ -1,0 +1,234 @@
+namespace tests
+import arm092.migrations.Column
+import arm092.migrations.MigrationError
+import arm092.migrations.Migrator
+import arm092.migrations.SchemaBuilder
+import arm092.migrations.SchemaChange
+import sha256 "go:crypto/sha256"
+import sql "go:database/sql"
+import fmt "go:fmt"
+import _ "go:modernc.org/sqlite"
+import os "go:os"
+import filepath "go:path/filepath"
+import strings "go:strings"
+
+import testing "go:testing"
+
+func TestSchemaBuilderWritesReversibleSQLiteMigration(t *testing.T) {
+	directory := t.TempDir()
+	builder := new SchemaBuilder("sqlite")
+	columns := []Column{
+		builder.Integer("id", false, true),
+		builder.Text("name", false),
+		builder.Text("email", true),
+	}
+	changes := []SchemaChange{
+		builder.CreateTable("people", columns),
+		builder.CreateIndex("people_name_idx", "people", []string{
+			"name",
+		}, false),
+		builder.CreateIndex("people_email_unique", "people", []string{
+			"email",
+		}, true),
+		builder.Raw("INSERT INTO people(id,name) VALUES (1,'Ada');", "DELETE FROM people WHERE id=1;"),
+	}
+	builder.Write(directory, "001_people.sql", changes)
+	put(t, directory, "002_manual.sql", "CREATE TABLE logs(id INTEGER PRIMARY KEY);")
+	put(t, directory, "002_manual.down.sql", "DROP TABLE logs;")
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 2 || migrator.Up() != 0 {
+		t.Fatal("generated and hand-written migrations did not apply exactly once")
+	}
+	var name string
+	db.QueryRow("SELECT name FROM people WHERE id=1").Scan(&name)
+	if name != "Ada" {
+		t.Fatal("generated table or raw SQL failed")
+	}
+	if migrator.Down(2) != 2 || migrator.Version() != "" {
+		t.Fatal("generated or hand-written rollback failed")
+	}
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('people','people_name_idx','people_email_unique','logs')").Scan(&count)
+	if count != 0 {
+		t.Fatal("generated rollback left schema objects")
+	}
+}
+
+func TestSchemaBuilderRejectsInvalidAndUnsupportedInput(t *testing.T) {
+	failed := false
+	try {
+		new SchemaBuilder("postgres")
+	} catch err MigrationError {
+		failed = strings.Contains(err.message, "Unsupported")
+	}
+	if !failed {
+		t.Fatal("unsupported dialect was accepted")
+	}
+	builder := new SchemaBuilder("sqlite")
+	failed = false
+	try {
+		builder.CreateTable("people; DROP TABLE users", []Column{
+			builder.Text("name", false),
+		})
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("unsafe identifier was accepted")
+	}
+	failed = false
+	try {
+		builder.CreateTable("people", []Column{})
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("empty table was accepted")
+	}
+	failed = false
+	try {
+		builder.CreateIndex("bad", "people", []string{
+			"name",
+			"name",
+		}, true)
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("duplicate index column was accepted")
+	}
+	failed = false
+	try {
+		new Column("name", "TEXT); DROP TABLE people; --", false, false)
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("arbitrary column type was accepted")
+	}
+	failed = false
+	try {
+		builder.Write("", "987_empty_directory.sql", []SchemaChange{
+			builder.Raw("SELECT 1", "SELECT 1"),
+		})
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("empty migration directory was accepted")
+	}
+}
+
+func TestSchemaBuilderPreservesMigrationIntegrityAndExistingFiles(t *testing.T) {
+	directory := t.TempDir()
+	builder := new SchemaBuilder("sqlite")
+	changes := []SchemaChange{
+		builder.CreateTable("things", []Column{
+			builder.Integer("id", false, true),
+		}),
+	}
+	builder.Write(directory, "001_things.sql", changes)
+	failed := false
+	try {
+		builder.Write(directory, "001_things.sql", changes)
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("existing migration was overwritten")
+	}
+	put(t, directory, "002_reserved.down.sql", "SELECT 1;")
+	failed = false
+	try {
+		builder.Write(directory, "002_reserved.sql", changes)
+	} catch err MigrationError {
+		failed = true
+	}
+	if !failed {
+		t.Fatal("existing rollback file was overwritten")
+	}
+	missing := false
+	try {
+		os.Stat(filepath.Join(directory, "002_reserved.sql"))
+	} catch err GoError {
+		missing = true
+	}
+	if !missing {
+		t.Fatal("failed write left forward migration behind")
+	}
+	os.Remove(filepath.Join(directory, "002_reserved.down.sql"))
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	defer db.Close()
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 1 {
+		t.Fatal("generated migration failed")
+	}
+	path := filepath.Join(directory, "001_things.sql")
+	os.WriteFile(path, []byte("CREATE TABLE changed(id INTEGER);"), 0600)
+	failed = false
+	try {
+		migrator.Version()
+	} catch err MigrationError {
+		failed = strings.Contains(err.message, "changed")
+	}
+	if !failed {
+		t.Fatal("generated migration bypassed checksum integrity")
+	}
+}
+
+func TestSchemaBuilderDetectsChangedRollbackAndUpgradesOldLedger(t *testing.T) {
+	directory := t.TempDir()
+	builder := new SchemaBuilder("sqlite")
+	builder.Write(directory, "001_items.sql", []SchemaChange{
+		builder.CreateTable("items", []Column{
+			builder.Integer("id", false, true),
+		}),
+	})
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	defer db.Close()
+	db.Exec("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL)")
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 1 {
+		t.Fatal("old ledger was not upgraded")
+	}
+	var rollbackChecksum string
+	db.QueryRow("SELECT down_checksum FROM schema_migrations WHERE version='001_items.sql'").Scan(&rollbackChecksum)
+	if rollbackChecksum == "" {
+		t.Fatal("rollback checksum was not recorded")
+	}
+	put(t, directory, "001_items.down.sql", "DROP TABLE other_items;")
+	failed := false
+	try {
+		migrator.Down(1)
+	} catch err MigrationError {
+		failed = strings.Contains(err.message, "rollback SQL is missing or changed")
+	}
+	var applied int
+	db.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version='001_items.sql'").Scan(&applied)
+	if !failed || applied != 1 {
+		t.Fatal("modified rollback file was accepted")
+	}
+}
+
+func TestLegacyAppliedMigrationRemainsReadable(t *testing.T) {
+	directory := t.TempDir()
+	statement := "CREATE TABLE old_items(id INTEGER);"
+	put(t, directory, "001_old.sql", statement)
+	put(t, directory, "001_old.down.sql", "DROP TABLE old_items;")
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	defer db.Close()
+	db.Exec("CREATE TABLE old_items(id INTEGER)")
+	db.Exec("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL)")
+	checksum := fmt.Sprintf("%x", sha256.Sum256([]byte(statement)))
+	db.Exec("INSERT INTO schema_migrations(version,checksum) VALUES (?,?)", "001_old.sql", checksum)
+	migrator := new Migrator(db, directory)
+	if migrator.Version() != "001_old.sql" || migrator.Up() != 0 {
+		t.Fatal("legacy applied row was not preserved")
+	}
+	if migrator.Down(1) != 1 || migrator.Version() != "" {
+		t.Fatal("legacy rollback did not work")
+	}
+}

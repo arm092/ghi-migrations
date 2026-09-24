@@ -18,6 +18,7 @@ type migration struct {
 	Up string
 	Down string
 	Checksum string
+	DownChecksum string
 }
 
 func migrationFiles(directory string) [] migration {
@@ -62,6 +63,7 @@ func migrationFiles(directory string) [] migration {
 		if downName, ok := downs[files[i].Name]; ok {
 			try { files[i].Down = string(os.ReadFile(filepath.Join(directory, downName))) } catch err GoError { throw new MigrationError("Cannot read rollback SQL " + downName + ": " + err.message) }
 			if strings.TrimSpace(files[i].Down) == "" { throw new MigrationError("Empty rollback SQL: " + downName) }
+			files[i].DownChecksum = fmt.Sprintf("%x", sha256.Sum256([] byte(strings.ReplaceAll(files[i].Down, "\r\n", "\n"))))
 		}
 	}
 	return files
@@ -85,16 +87,24 @@ class Migrator {
 	}
 
 	private func history(files[] migration) map[string] string {
-		try { this.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL)") } catch err GoError { throw new MigrationError("Cannot initialize migration history: " + err.message) }
+		try { this.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL,down_checksum TEXT NOT NULL DEFAULT '')") } catch err GoError { throw new MigrationError("Cannot initialize migration history: " + err.message) }
+		var column string
+		try { this.db.QueryRow("SELECT name FROM pragma_table_info('schema_migrations') WHERE name='down_checksum'").Scan(& column) } catch err GoError {
+			if ! errors.Is(err.cause, sql.ErrNoRows) { throw new MigrationError("Cannot inspect migration history: " + err.message) }
+			try { this.db.Exec("ALTER TABLE schema_migrations ADD COLUMN down_checksum TEXT NOT NULL DEFAULT ''") } catch alterErr GoError { throw new MigrationError("Cannot upgrade migration history: " + alterErr.message) }
+		}
 		var rows * sql.Rows
-		try { rows = this.db.Query("SELECT version,checksum FROM schema_migrations ORDER BY version") } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
+		try { rows = this.db.Query("SELECT version,checksum,down_checksum FROM schema_migrations ORDER BY version") } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
 		defer rows.Close()
 		applied := map[string] string {}
+		rollbackChecksums := map[string] string {}
 		for rows.Next() {
 			var version string
 			var checksum string
-			try { rows.Scan(& version, & checksum) } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
+			var downChecksum string
+			try { rows.Scan(& version, & checksum, & downChecksum) } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
 			applied[version] = checksum
+			rollbackChecksums[version] = downChecksum
 		}
 		rows.Close()
 		try { rows.Err() } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
@@ -104,6 +114,7 @@ class Migrator {
 				if file.Name == name {
 					found = true
 					if file.Checksum != checksum { throw new MigrationError("Applied SQL migration is missing or changed: " + name) }
+					if rollbackChecksums[name] != "" && file.DownChecksum != rollbackChecksums[name] { throw new MigrationError("Applied rollback SQL is missing or changed: " + name) }
 				}
 			}
 			if ! found { throw new MigrationError("Applied SQL migration is missing or changed: " + name) }
@@ -138,7 +149,7 @@ class Migrator {
 				skip := false
 				if adopt != nil { skip = adopt(tx, file.Name) }
 				if ! skip { tx.Exec(file.Up) }
-				tx.Exec("INSERT INTO schema_migrations(version,checksum) VALUES (?,?)", file.Name, file.Checksum)
+				tx.Exec("INSERT INTO schema_migrations(version,checksum,down_checksum) VALUES (?,?,?)", file.Name, file.Checksum, file.DownChecksum)
 				tx.Commit()
 			} catch err GoError {
 				rollbackMigration(tx)
