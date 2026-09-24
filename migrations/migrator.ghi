@@ -1,4 +1,4 @@
-namespace migrations
+namespace arm092.migrations
 
 import context "go:context"
 import sql "go:database/sql"

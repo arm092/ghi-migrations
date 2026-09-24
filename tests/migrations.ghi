@@ -6,8 +6,8 @@ import _ "go:modernc.org/sqlite"
 import os "go:os"
 import filepath "go:path/filepath"
 import strings "go:strings"
-import migrations.Migrator
-import migrations.MigrationError
+import arm092.migrations.Migrator
+import arm092.migrations.MigrationError
 
 func put(t * testing.T, directory string, name string, statement string) {
 	try { os.WriteFile(filepath.Join(directory, name), [] byte(statement), 0600) } catch err GoError { t.Fatal(err.message) }
@@ -57,7 +57,7 @@ func TestChangedHistoryAndAtomicRetry(t * testing.T) {
 	if migrator.Up() != 1 { t.Fatal("retry did not apply repaired migration") }
 	put(t, directory, "001_initial.sql", "SELECT 1;")
 	rejected := false
-	try { migrator.Version() } catch err MigrationError { rejected = strings.Contains(err.message, "changed") && err.code == 0 && err.typeName == "migrations.MigrationError" && len(err.stackTrace) > 0 }
+	try { migrator.Version() } catch err MigrationError { rejected = strings.Contains(err.message, "changed") && err.code == 0 && err.typeName == "arm092.migrations.MigrationError" && len(err.stackTrace) > 0 }
 	if ! rejected { t.Fatal("changed history was accepted or exception metadata was missing") }
 }
 
