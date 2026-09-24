@@ -1,0 +1,124 @@
+namespace tests
+
+import testing "go:testing"
+import sql "go:database/sql"
+import _ "go:modernc.org/sqlite"
+import os "go:os"
+import filepath "go:path/filepath"
+import strings "go:strings"
+import migrations.Migrator
+import migrations.MigrationError
+
+func put(t * testing.T, directory string, name string, statement string) {
+	try { os.WriteFile(filepath.Join(directory, name), [] byte(statement), 0600) } catch err GoError { t.Fatal(err.message) }
+}
+
+func TestApplyRollbackAndReopen(t * testing.T) {
+	directory := t.TempDir()
+	put(t, directory, "001_initial.sql", "CREATE TABLE things(id INTEGER PRIMARY KEY);\n")
+	put(t, directory, "001_initial.down.sql", "DROP TABLE things;")
+	put(t, directory, "002_more.sql", "INSERT INTO things(id) VALUES (1);")
+	put(t, directory, "002_more.down.sql", "DELETE FROM things WHERE id=1;")
+	path := filepath.Join(t.TempDir(), "test.db")
+	db := sql.Open("sqlite", path)
+	db.SetMaxOpenConns(1)
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 2 || migrator.Version() != "002_more.sql" { t.Fatal("migrations did not apply") }
+	if migrator.Up() != 0 { t.Fatal("repeated Up changed state") }
+	db.Close()
+	db = sql.Open("sqlite", path)
+	db.SetMaxOpenConns(1)
+	migrator = new Migrator(db, directory)
+	if migrator.Version() != "002_more.sql" || migrator.Down(1) != 1 || migrator.Version() != "001_initial.sql" { t.Fatal("reopen or rollback failed") }
+	if migrator.Up() != 1 || migrator.Version() != "002_more.sql" { t.Fatal("reapply after rollback failed") }
+	if migrator.Down(2) != 2 || migrator.Version() != "" { t.Fatal("bounded rollback did not return to an empty history") }
+	if migrator.Up() != 2 || migrator.Version() != "002_more.sql" { t.Fatal("reapply after full rollback failed") }
+	db.Close()
+}
+
+func TestChangedHistoryAndAtomicRetry(t * testing.T) {
+	directory := t.TempDir()
+	put(t, directory, "001_initial.sql", "CREATE TABLE things(id INTEGER);\n")
+	path := filepath.Join(t.TempDir(), "test.db")
+	db := sql.Open("sqlite", path)
+	defer db.Close()
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 1 { t.Fatal("first migration was not applied") }
+	put(t, directory, "001_initial.sql", "CREATE TABLE things(id INTEGER);\r\n")
+	if migrator.Version() != "001_initial.sql" { t.Fatal("line ending change invalidated history") }
+	put(t, directory, "002_bad.sql", "CREATE TABLE partial(id INTEGER); INSERT INTO missing VALUES (1);")
+	failed := false
+	try { migrator.Up() } catch err MigrationError { failed = true }
+	if ! failed { t.Fatal("broken migration succeeded") }
+	var partial int
+	db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='partial'").Scan(& partial)
+	if partial != 0 || migrator.Version() != "001_initial.sql" { t.Fatal("failed migration left partial state") }
+	put(t, directory, "002_bad.sql", "CREATE TABLE complete(id INTEGER);")
+	if migrator.Up() != 1 { t.Fatal("retry did not apply repaired migration") }
+	put(t, directory, "001_initial.sql", "SELECT 1;")
+	rejected := false
+	try { migrator.Version() } catch err MigrationError { rejected = strings.Contains(err.message, "changed") && err.code == 0 && err.typeName == "migrations.MigrationError" && len(err.stackTrace) > 0 }
+	if ! rejected { t.Fatal("changed history was accepted or exception metadata was missing") }
+}
+
+func TestHistoryOrderMissingFilesAndRollbackBounds(t * testing.T) {
+	directory := t.TempDir()
+	put(t, directory, "001_first.sql", "CREATE TABLE first(id INTEGER);")
+	put(t, directory, "002_second.sql", "CREATE TABLE second(id INTEGER);")
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	defer db.Close()
+	migrator := new Migrator(db, directory)
+	if migrator.Up() != 2 { t.Fatal("initial migration count was wrong") }
+	put(t, directory, "000_prior.sql", "CREATE TABLE prior(id INTEGER);")
+	rejected := false
+	try { migrator.Up() } catch err MigrationError { rejected = strings.Contains(err.message, "inserted") }
+	if ! rejected { t.Fatal("out-of-order migration was accepted") }
+	os.Remove(filepath.Join(directory, "000_prior.sql"))
+	put(t, directory, "001_first.down.sql", "DROP TABLE first;")
+	rejected = false
+	try { migrator.Down(2) } catch err MigrationError { rejected = strings.Contains(err.message, "missing") }
+	if ! rejected || migrator.Version() != "002_second.sql" { t.Fatal("missing rollback SQL changed history") }
+	rejected = false
+	try { migrator.Down(3) } catch err MigrationError { rejected = strings.Contains(err.message, "exceeds") }
+	if ! rejected { t.Fatal("excessive rollback count was accepted") }
+	rejected = false
+	try { migrator.Down(0) } catch err MigrationError { rejected = strings.Contains(err.message, "positive") }
+	if ! rejected { t.Fatal("nonpositive rollback count was accepted") }
+	os.Remove(filepath.Join(directory, "001_first.sql"))
+	os.Remove(filepath.Join(directory, "001_first.down.sql"))
+	rejected = false
+	try { migrator.Version() } catch err MigrationError { rejected = strings.Contains(err.message, "missing") }
+	if ! rejected { t.Fatal("missing applied migration was accepted") }
+}
+
+func TestAdoptionAndRollbackFailureAreAtomic(t * testing.T) {
+	directory := t.TempDir()
+	put(t, directory, "001_initial.sql", "CREATE TABLE tasks(id INTEGER PRIMARY KEY);")
+	put(t, directory, "002_add.sql", "ALTER TABLE tasks ADD COLUMN added TEXT;")
+	put(t, directory, "002_add.down.sql", "CREATE TABLE rollback_partial(id INTEGER); INSERT INTO missing VALUES (1);")
+	db := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrator := new Migrator(db, directory)
+	failed := false
+	try {
+		migrator.UpWithAdoption(func (tx * sql.Tx, name string) bool {
+				if name == "002_add.sql" { tx.Exec("CREATE TABLE adoption_partial(id INTEGER)"); throw new MigrationError("adoption refused") }
+				return false
+			})
+	} catch err MigrationError { failed = strings.Contains(err.message, "adoption refused") }
+	if ! failed || migrator.Version() != "001_initial.sql" { t.Fatal("failed adoption changed migration history") }
+	var partial int
+	db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='adoption_partial'").Scan(& partial)
+	if partial != 0 { t.Fatal("failed adoption left schema changes") }
+	if migrator.UpWithAdoption(func (tx * sql.Tx, name string) bool {
+			if name == "002_add.sql" { tx.Exec("ALTER TABLE tasks ADD COLUMN added TEXT"); return true }
+			return false
+		}) != 1 { t.Fatal("adopted migration was not recorded") }
+	if migrator.Version() != "002_add.sql" { t.Fatal("adoption did not write ledger") }
+	failed = false
+	try { migrator.Down(1) } catch err MigrationError { failed = strings.Contains(err.message, "Cannot roll back") }
+	if ! failed || migrator.Version() != "002_add.sql" { t.Fatal("failed rollback changed ledger") }
+	db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='rollback_partial'").Scan(& partial)
+	if partial != 0 { t.Fatal("failed rollback left schema changes") }
+}

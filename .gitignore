@@ -1,0 +1,5 @@
+.ghi/
+*.exe
+work/
+outputs/
+*.md

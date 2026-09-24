@@ -1,0 +1,185 @@
+namespace migrations
+
+import context "go:context"
+import sql "go:database/sql"
+import errors "go:errors"
+import os "go:os"
+import filepath "go:path/filepath"
+import regexp "go:regexp"
+import sort "go:sort"
+import strconv "go:strconv"
+import strings "go:strings"
+import sha256 "go:crypto/sha256"
+import fmt "go:fmt"
+
+type migration struct {
+	Name string
+	Version string
+	Up string
+	Down string
+	Checksum string
+}
+
+func migrationFiles(directory string) [] migration {
+	files := [] migration {}
+	versions := map[int] bool {}
+	ups := map[string] bool {}
+	downs := map[string] string {}
+	entries := [] os.DirEntry {}
+	try { entries = os.ReadDir(directory) } catch err GoError { throw new MigrationError("Cannot read SQL migration directory: " + err.message) }
+	for _, entry := range entries {
+		if entry.IsDir() { continue }
+		name := entry.Name()
+		if strings.HasSuffix(name, ".down.sql") {
+			base := strings.TrimSuffix(name, ".down.sql") + ".sql"
+			if ! regexp.MatchString(`^[0-9]+_[a-z0-9_]+\.sql$`, base) { throw new MigrationError("Invalid SQL migration filename: " + name) }
+			downs[base] = name
+			continue
+		}
+		if ! strings.HasSuffix(name, ".sql") { continue }
+		if ! regexp.MatchString(`^[0-9]+_[a-z0-9_]+\.sql$`, name) { throw new MigrationError("Invalid SQL migration filename: " + name) }
+		version := strings.SplitN(name, "_", 2) [0]
+		number := 0
+		try { number = strconv.Atoi(version) } catch err GoError { throw new MigrationError("Invalid SQL migration version: " + version) }
+		if versions[number] { throw new MigrationError("Duplicate SQL migration version: " + version) }
+		versions[number] = true
+		ups[name] = true
+		data := [] byte {}
+		try { data = os.ReadFile(filepath.Join(directory, name)) } catch err GoError { throw new MigrationError("Cannot read SQL migration " + name + ": " + err.message) }
+		statement := string(data)
+		if strings.TrimSpace(statement) == "" { throw new MigrationError("Empty SQL migration: " + name) }
+		checksum := fmt.Sprintf("%x", sha256.Sum256([] byte(strings.ReplaceAll(statement, "\r\n", "\n"))))
+		files = append(files, migration { Name: name, Version: version, Up: statement, Checksum: checksum })
+	}
+	if len(files) == 0 { throw new MigrationError("No SQL migrations found in " + directory) }
+	for name := range downs { if ! ups[name] { throw new MigrationError("Rollback SQL has no matching migration: " + downs[name]) } }
+	sort.Slice(files, func (i int, j int) bool {
+			left := strconv.Atoi(files[i].Version)
+			right := strconv.Atoi(files[j].Version)
+			return left < right
+		})
+	for i := range files {
+		if downName, ok := downs[files[i].Name]; ok {
+			try { files[i].Down = string(os.ReadFile(filepath.Join(directory, downName))) } catch err GoError { throw new MigrationError("Cannot read rollback SQL " + downName + ": " + err.message) }
+			if strings.TrimSpace(files[i].Down) == "" { throw new MigrationError("Empty rollback SQL: " + downName) }
+		}
+	}
+	return files
+}
+
+func rollbackMigration(tx * sql.Tx) {
+	try { tx.Rollback() } catch err GoError {
+		if ! errors.Is(err.cause, sql.ErrTxDone) { throw err }
+	}
+}
+
+class Migrator {
+	private db * sql.DB
+	private directory string
+
+	constructor(db * sql.DB, directory string) {
+		if db == nil { throw new MigrationError("Database connection is required") }
+		if directory == "" { throw new MigrationError("Migration directory is required") }
+		this.db = db
+		this.directory = directory
+	}
+
+	private func history(files[] migration) map[string] string {
+		try { this.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL)") } catch err GoError { throw new MigrationError("Cannot initialize migration history: " + err.message) }
+		var rows * sql.Rows
+		try { rows = this.db.Query("SELECT version,checksum FROM schema_migrations ORDER BY version") } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
+		defer rows.Close()
+		applied := map[string] string {}
+		for rows.Next() {
+			var version string
+			var checksum string
+			try { rows.Scan(& version, & checksum) } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
+			applied[version] = checksum
+		}
+		rows.Close()
+		try { rows.Err() } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
+		for name, checksum := range applied {
+			found := false
+			for _, file := range files {
+				if file.Name == name {
+					found = true
+					if file.Checksum != checksum { throw new MigrationError("Applied SQL migration is missing or changed: " + name) }
+				}
+			}
+			if ! found { throw new MigrationError("Applied SQL migration is missing or changed: " + name) }
+		}
+		latest := - 1
+		for i, file := range files { if applied[file.Name] != "" { latest = i } }
+		for i, file := range files {
+			if applied[file.Name] == "" && i < latest { throw new MigrationError("SQL migrations cannot be inserted before applied history: " + file.Name) }
+		}
+		return applied
+	}
+
+	public func Version() string {
+		files := migrationFiles(this.directory)
+		applied := this.history(files)
+		latest := ""
+		for _, file := range files { if applied[file.Name] != "" { latest = file.Name } }
+		return latest
+	}
+
+	public func Up() int { return this.UpWithAdoption(nil) }
+
+	public func UpWithAdoption(adopt func (* sql.Tx, string) bool) int {
+		files := migrationFiles(this.directory)
+		applied := this.history(files)
+		count := 0
+		for _, file := range files {
+			if applied[file.Name] != "" { continue }
+			var tx * sql.Tx
+			try { tx = this.db.BeginTx(context.Background(), nil) } catch err GoError { throw new MigrationError("Cannot start SQL migration " + file.Name + ": " + err.message) }
+			try {
+				skip := false
+				if adopt != nil { skip = adopt(tx, file.Name) }
+				if ! skip { tx.Exec(file.Up) }
+				tx.Exec("INSERT INTO schema_migrations(version,checksum) VALUES (?,?)", file.Name, file.Checksum)
+				tx.Commit()
+			} catch err GoError {
+				rollbackMigration(tx)
+				throw new MigrationError("Cannot apply SQL migration " + file.Name + ": " + err.message)
+			} catch err Exception {
+				rollbackMigration(tx)
+				throw err
+			}
+			count++
+		}
+		return count
+	}
+
+	public func Down(steps int) int {
+		if steps <= 0 { throw new MigrationError("Rollback steps must be positive") }
+		files := migrationFiles(this.directory)
+		applied := this.history(files)
+		selected := [] migration {}
+		for i := len(files) - 1; i >= 0; i-- {
+			if applied[files[i].Name] != "" { selected = append(selected, files[i]) }
+		}
+		if steps > len(selected) { throw new MigrationError("Rollback exceeds applied migration count") }
+		for i := 0; i < steps; i++ {
+			if selected[i].Down == "" { throw new MigrationError("Rollback SQL is missing for " + selected[i].Name) }
+		}
+		for i := 0; i < steps; i++ {
+			file := selected[i]
+			var tx * sql.Tx
+			try { tx = this.db.BeginTx(context.Background(), nil) } catch err GoError { throw new MigrationError("Cannot start rollback of " + file.Name + ": " + err.message) }
+			try {
+				tx.Exec(file.Down)
+				tx.Exec("DELETE FROM schema_migrations WHERE version=?", file.Name)
+				tx.Commit()
+			} catch err GoError {
+				rollbackMigration(tx)
+				throw new MigrationError("Cannot roll back SQL migration " + file.Name + ": " + err.message)
+			} catch err Exception {
+				rollbackMigration(tx)
+				throw err
+			}
+		}
+		return steps
+	}
+}

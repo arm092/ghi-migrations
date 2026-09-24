@@ -1,0 +1,5 @@
+namespace migrations
+
+class MigrationError extends Exception {
+	constructor(message string, code int = 0) { parent(message, code) }
+}
