@@ -60,7 +60,7 @@ func TestSchemaBuilderWritesReversibleSQLiteMigration(t *testing.T) {
 func TestSchemaBuilderRejectsInvalidAndUnsupportedInput(t *testing.T) {
 	failed := false
 	try {
-		new SchemaBuilder("postgres")
+		new SchemaBuilder("oracle")
 	} catch err MigrationError {
 		failed = strings.Contains(err.message, "Unsupported")
 	}

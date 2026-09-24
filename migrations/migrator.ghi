@@ -78,20 +78,34 @@ func rollbackMigration(tx * sql.Tx) {
 class Migrator {
 	private db * sql.DB
 	private directory string
+	private dialect string
 
-	constructor(db * sql.DB, directory string) {
+	constructor(db * sql.DB, directory string, dialect string = "sqlite") {
 		if db == nil { throw new MigrationError("Database connection is required") }
 		if directory == "" { throw new MigrationError("Migration directory is required") }
+		if dialect != "sqlite" && dialect != "mysql" && dialect != "postgres" { throw new MigrationError("Unsupported migration dialect: " + dialect) }
 		this.db = db
 		this.directory = directory
+		this.dialect = dialect
 	}
 
 	private func history(files[] migration) map[string] string {
-		try { this.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL,down_checksum TEXT NOT NULL DEFAULT '')") } catch err GoError { throw new MigrationError("Cannot initialize migration history: " + err.message) }
+		create := "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY,checksum TEXT NOT NULL,down_checksum TEXT NOT NULL DEFAULT '')"
+		lookup := "SELECT name FROM pragma_table_info('schema_migrations') WHERE name='down_checksum'"
+		addition := "ALTER TABLE schema_migrations ADD COLUMN down_checksum TEXT NOT NULL DEFAULT ''"
+		if this.dialect == "mysql" {
+			create = "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY,checksum CHAR(64) NOT NULL,down_checksum CHAR(64) NOT NULL DEFAULT '')"
+			lookup = "SELECT column_name FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='schema_migrations' AND column_name='down_checksum'"
+			addition = "ALTER TABLE schema_migrations ADD COLUMN down_checksum CHAR(64) NOT NULL DEFAULT ''"
+		}
+		if this.dialect == "postgres" {
+			lookup = "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='schema_migrations' AND column_name='down_checksum'"
+		}
+		try { this.db.Exec(create) } catch err GoError { throw new MigrationError("Cannot initialize migration history: " + err.message) }
 		var column string
-		try { this.db.QueryRow("SELECT name FROM pragma_table_info('schema_migrations') WHERE name='down_checksum'").Scan(& column) } catch err GoError {
+		try { this.db.QueryRow(lookup).Scan(& column) } catch err GoError {
 			if ! errors.Is(err.cause, sql.ErrNoRows) { throw new MigrationError("Cannot inspect migration history: " + err.message) }
-			try { this.db.Exec("ALTER TABLE schema_migrations ADD COLUMN down_checksum TEXT NOT NULL DEFAULT ''") } catch alterErr GoError { throw new MigrationError("Cannot upgrade migration history: " + alterErr.message) }
+			try { this.db.Exec(addition) } catch alterErr GoError { throw new MigrationError("Cannot upgrade migration history: " + alterErr.message) }
 		}
 		var rows * sql.Rows
 		try { rows = this.db.Query("SELECT version,checksum,down_checksum FROM schema_migrations ORDER BY version") } catch err GoError { throw new MigrationError("Cannot read migration history: " + err.message) }
@@ -140,16 +154,43 @@ class Migrator {
 	public func UpWithAdoption(adopt func (* sql.Tx, string) bool) int {
 		files := migrationFiles(this.directory)
 		applied := this.history(files)
+		insert := "INSERT INTO schema_migrations(version,checksum,down_checksum) VALUES (?,?,?)"
+		if this.dialect == "postgres" { insert = "INSERT INTO schema_migrations(version,checksum,down_checksum) VALUES ($1,$2,$3)" }
 		count := 0
 		for _, file := range files {
 			if applied[file.Name] != "" { continue }
+			if this.dialect == "mysql" {
+				if adopt != nil {
+					var inspect * sql.Tx
+					try { inspect = this.db.BeginTx(context.Background(), nil) } catch err GoError { throw new MigrationError("Cannot inspect MySQL migration " + file.Name + ": " + err.message) }
+					try {
+						if adopt(inspect, file.Name) {
+							inspect.Exec(insert, file.Name, file.Checksum, file.DownChecksum)
+							inspect.Commit()
+							count++
+							continue
+						}
+						rollbackMigration(inspect)
+					} catch err GoError {
+						rollbackMigration(inspect)
+						throw new MigrationError("Cannot inspect MySQL migration " + file.Name + ": " + err.message)
+					} catch err Exception {
+						rollbackMigration(inspect)
+						throw err
+					}
+				}
+				try { this.db.Exec(file.Up) } catch err GoError { throw new MigrationError("Cannot apply MySQL migration " + file.Name + "; schema may need manual reconciliation: " + err.message) }
+				try { this.db.Exec(insert, file.Name, file.Checksum, file.DownChecksum) } catch err GoError { throw new MigrationError("MySQL migration " + file.Name + " ran but history was not recorded; manual reconciliation required: " + err.message) }
+				count++
+				continue
+			}
 			var tx * sql.Tx
 			try { tx = this.db.BeginTx(context.Background(), nil) } catch err GoError { throw new MigrationError("Cannot start SQL migration " + file.Name + ": " + err.message) }
 			try {
 				skip := false
 				if adopt != nil { skip = adopt(tx, file.Name) }
 				if ! skip { tx.Exec(file.Up) }
-				tx.Exec("INSERT INTO schema_migrations(version,checksum,down_checksum) VALUES (?,?,?)", file.Name, file.Checksum, file.DownChecksum)
+				tx.Exec(insert, file.Name, file.Checksum, file.DownChecksum)
 				tx.Commit()
 			} catch err GoError {
 				rollbackMigration(tx)
@@ -177,11 +218,18 @@ class Migrator {
 		}
 		for i := 0; i < steps; i++ {
 			file := selected[i]
+			deleteStatement := "DELETE FROM schema_migrations WHERE version=?"
+			if this.dialect == "postgres" { deleteStatement = "DELETE FROM schema_migrations WHERE version=$1" }
+			if this.dialect == "mysql" {
+				try { this.db.Exec(file.Down) } catch err GoError { throw new MigrationError("Cannot roll back MySQL migration " + file.Name + "; schema may need manual reconciliation: " + err.message) }
+				try { this.db.Exec(deleteStatement, file.Name) } catch err GoError { throw new MigrationError("MySQL rollback " + file.Name + " ran but history was not removed; manual reconciliation required: " + err.message) }
+				continue
+			}
 			var tx * sql.Tx
 			try { tx = this.db.BeginTx(context.Background(), nil) } catch err GoError { throw new MigrationError("Cannot start rollback of " + file.Name + ": " + err.message) }
 			try {
 				tx.Exec(file.Down)
-				tx.Exec("DELETE FROM schema_migrations WHERE version=?", file.Name)
+				tx.Exec(deleteStatement, file.Name)
 				tx.Commit()
 			} catch err GoError {
 				rollbackMigration(tx)
